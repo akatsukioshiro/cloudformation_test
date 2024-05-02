@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SerialTimestampTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: SerialNumber
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: SerialNumber
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        Enabled: FALSE
+
+  GetLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Key, Attr
+          
+          def handler(event, context):
+              # Create a DynamoDB resource
+              dynamodb = boto3.resource('dynamodb')
+              # Select your table
+              table = dynamodb.Table('SerialTimestampTable')
+              # Get the items
+              response = table.scan(
+                  FilterExpression=Attr('Timestamp').exists(),
+                  Limit=10
+              )
+              items = response['Items']
+              # Return the last 10 items
+              items.sort(key=lambda x: x['Timestamp'], reverse=True)
+              last_ten = items[:10]
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(last_ten)
+              }
+      Runtime: python3.8
+      Timeout: 10
+
+  PostLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+              import json
+              import boto3
+              from datetime import datetime
+
+              def handler(event, context):
+                  # Initialize a DynamoDB resource
+                  dynamodb = boto3.resource('dynamodb')
+                  # Reference your table
+                  table = dynamodb.Table('SerialTimestampTable')
+
+                  try:
+                      # Scan the table to find the highest serial number (inefficient for large datasets)
+                      response = table.scan(
+                          ProjectionExpression="SerialNumber",
+                          Limit=1000  # Limit to prevent excessive read costs; adjust based on your use case
+                      )
+                      highest_serial = max(int(item['SerialNumber']) for item in response['Items']) if response['Items'] else 0
+                  except Exception as e:
+                      print(e)
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'message': 'Failed to retrieve the current serial number'})
+                      }
+
+                  # Increment the serial number
+                  new_serial = highest_serial + 1
+
+                  # Insert a new item with the new serial number
+                  try:
+                      table.put_item(
+                          Item={
+                              'SerialNumber': str(new_serial),
+                              'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                          }
+                      )
+                  except Exception as e:
+                      print(e)
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'message': 'Error updating the serial number'})
+                      }
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Serial number updated successfully', 'new_serial': new_serial})
+                  }
+      Runtime: python3.8
+      Timeout: 10
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: LambdaDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ["dynamodb:PutItem", "dynamodb:Scan", "dynamodb:GetItem"]
+                Resource: "*"
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: MyServerlessApiGateway
+      Description: API Gateway for serverless application
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt 'ApiGateway.RootResourceId'
+      RestApiId: !Ref ApiGateway
+      PathPart: 'data'
+
+  ApiGatewayGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetLambdaFunction.Arn}/invocations'
+
+  ApiGatewayPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PostLambdaFunction.Arn}/invocations'
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayGetMethod
+      - ApiGatewayPostMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+  GetLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt GetLambdaFunction.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/data'
+
+  PostLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt PostLambdaFunction.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/data'
+
